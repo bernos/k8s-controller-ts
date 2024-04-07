@@ -1,0 +1,31 @@
+{
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "skuba build",
+    "format": "skuba format",
+    "lint": "skuba lint",
+    "start": "skuba start",
+    "start:debug": "pnpm --silent start --inspect-brk",
+    "test": "skuba test",
+    "test:ci": "skuba test --coverage",
+    "test:watch": "skuba test --watch"
+  },
+  "dependencies": {
+    "skuba-dive": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "skuba": "^8.0.0"
+  },
+  "packageManager": "pnpm@8.15.5",
+  "engines": {
+    "node": ">=20"
+  },
+  "skuba": {
+    "entryPoint": "src/app.ts",
+    "template": "greeter",
+    "type": "application",
+    "version": "8.0.0"
+  }
+}
