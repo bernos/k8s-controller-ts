@@ -1,9 +1,9 @@
 import * as k8s from '@kubernetes/client-node';
-import * as Async from 'async';
 import * as https from 'https';
 import { ResourceMetadata, ResourceMetadataId } from './resource-metadata'; 
-import { WatchEvent, WatchEventPhase, WatchSpec, WatchEventHandler } from './watch-event';
+import { WatchEvent, WatchEventHandler, WatchEventPhase, WatchEventTaskQueue, WatchSpec } from './watch-event';
 import { IncomingMessage } from 'http';
+import { ReconcileRequestDispatcher, ReconcileRequestQueuer, Reconciler } from './reconciler';
 
 export interface Response {
   statusCode?:number;
@@ -11,18 +11,6 @@ export interface Response {
   body?:any;
 }
 
-interface UntypedWatchEvent {
-  phase: WatchEventPhase;
-  resource: k8s.KubernetesObject;
-  meta: ResourceMetadata;
-}
-
-type UntypedWatchEventHandler = (e:UntypedWatchEvent) => Promise<void>;
-
-interface WatchEventTask {
-  event: UntypedWatchEvent;
-  handler: UntypedWatchEventHandler;
-}
 
 /**
  * An active request to the k8s client watch api
@@ -31,25 +19,28 @@ interface WatchRequest {
   abort: () => void;
 }
 
+
 /**
  * Base class for custom k8s controllers
  */
-export abstract class Controller {
+export class Controller {
   protected readonly k8sApi: k8s.CoreV1Api;
 
   private readonly watchInstance: k8s.Watch;
   private readonly watchRequests: Record<string, WatchRequest> = {};
   private readonly resourceApiUriBuilders: Record<ResourceMetadataId, (metadata: ResourceMetadata) => string> = {};
-  private readonly watchEventQueue: Async.QueueObject<WatchEventTask>;
+  // private readonly watchEventQueue: Async.QueueObject<WatchEventTask>;
+  private readonly watchEventQueue: WatchEventTaskQueue = new WatchEventTaskQueue();
+  private readonly pendingReconcilerSetups: Array<() => Promise<void>> = [];
 
-  private started: boolean;
+
+  private started: boolean = false;
   private doneCallback: ((err: any) => void) | undefined;
 
   constructor(readonly kubeConfig: k8s.KubeConfig) {
     this.k8sApi = kubeConfig.makeApiClient(k8s.CoreV1Api);
     this.watchInstance = new k8s.Watch(kubeConfig);
-    this.watchEventQueue = Async.queue(async (task: WatchEventTask) => task.handler(task.event));
-    this.started = false;
+    // this.watchEventQueue = Async.queue(async (task: WatchEventTask) => task.handler(task.event));
   }
 
   /**
@@ -59,36 +50,26 @@ export abstract class Controller {
     if (!this.started) {
       this.started = true;
       this.doneCallback = done;
-      await this.init();
+
+      while (this.pendingReconcilerSetups.length) {
+        this.pendingReconcilerSetups.pop()!();
+      }
     }
+  }
+
+  public withReconciler = <T extends k8s.KubernetesObject>(watchSpec:WatchSpec, reconciler:Reconciler<T>): Controller => {
+
+    this.pendingReconcilerSetups.push(async () => {
+      this.watch(watchSpec, reconciler)
+    });
+
+    return this;
   }
 
   /**
    * Stop the controller. Any active watch requests will be aborted.
    */
   public stop = (): void => Object.values(this.watchRequests).forEach(req => req.abort());
-
-  /**
-   * Initialise the controller. Register any resource watchers here.
-   */
-  protected abstract init(): Promise<void>;
-
-  protected watchV1Namespaces = async (handler: WatchEventHandler<k8s.V1Namespace>): Promise<void> =>
-    this.watch(new WatchSpec('', 'v1', 'namespaces'), handler);
-
-  protected watchV1Pods = async (handler: WatchEventHandler<k8s.V1Pod>, namespace?: string): Promise<void> =>
-    this.watch(new WatchSpec('', 'v1', 'pods', namespace ?? ''), handler);
-
-  protected watchV1Beta1ServiceEntries = async (handler: WatchEventHandler<k8s.KubernetesObjectWithSpec>, namespace?: string): Promise<void> =>
-    this.watch(new WatchSpec('networking.istio.io', 'v1beta1', 'serviceentries', namespace ?? ''), handler);
-
-  /**
-   * Convert an instance method to a WatchEventHandler. Makes it easier to create simple controllers whose
-   * watch event handlers are just class instance methods, rather than creating dedicated WatchEventHandler
-   * types.
-   */
-  protected watchEventHandlerFromMethod = <T extends k8s.KubernetesObject>(fn: (e: WatchEvent<T>) => Promise<void>): WatchEventHandler<T> => 
-    ({ onWatchEvent: fn.bind(this) });
   
   /**
    * Returns the fully qualied k8s API uri for a resource
@@ -108,27 +89,19 @@ export abstract class Controller {
    */
   protected statusUrl = (metadata: ResourceMetadata): string => `${this.resourceApiUrl(metadata)}/status`;
 
-  protected watch = async <T extends k8s.KubernetesObject>(watchSpec: WatchSpec, handler: WatchEventHandler<T>): Promise<void> => {
+  private watch = async <T extends k8s.KubernetesObject>(watchSpec: WatchSpec, reconciler: Reconciler<T>): Promise<void> => {
+
+    const dispatcher = new ReconcileRequestDispatcher(reconciler, this.watchEventQueue, watchSpec);
 
     // Create a callback function that will run whenever our watch triggers. The callback will enque the untyped
     // watch event, and a wrapped version of the handler func that will co-erce the untyped event into the desired
     // type.
-    const callback = (phase: string, apiObj: k8s.KubernetesObject, watchObj?: any): void => {
-      this.watchEventQueue.push({
-        event: {
-          phase: phase as WatchEventPhase,
-          resource: apiObj,
-          meta: ResourceMetadata.fromId(watchSpec.id, apiObj)
-        },
-        handler: async ({phase, resource, meta}): Promise<void> => {
-          return handler.onWatchEvent({
-            phase,
-            meta,
-            resource: resource as T
-          })
-        }        
+    const callback = (phase: string, apiObj: k8s.KubernetesObject, watchObj?: any): void =>
+      dispatcher.dispatch({
+        phase: phase as WatchEventPhase,
+        resource: apiObj,
+        meta: ResourceMetadata.fromId(watchSpec.id, apiObj)
       });
-    }
 
     // Done function is called if the watch terminates normally. If the watch terminated because of an error, err will be
     // set. If err is set we bail, otherwise we restart the watch.
