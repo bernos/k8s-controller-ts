@@ -12,9 +12,12 @@
     "test:watch": "skuba test --watch"
   },
   "dependencies": {
+    "@kubernetes/client-node": "^0.20.0",
+    "async": "^3.2.5",
     "skuba-dive": "^2.0.0"
   },
   "devDependencies": {
+    "@types/async": "^3.2.24",
     "@types/node": "^20.9.0",
     "skuba": "^8.0.0"
   },
